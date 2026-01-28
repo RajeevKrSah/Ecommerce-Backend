@@ -15,6 +15,11 @@ return Application::configure(basePath: dirname(__DIR__))
         // Global middleware
         $middleware->append(\App\Http\Middleware\SecurityHeaders::class);
         
+        // Middleware aliases
+        $middleware->alias([
+            'admin' => \App\Http\Middleware\AdminMiddleware::class,
+        ]);
+        
         // Web middleware group
         $middleware->web([
             \Illuminate\Cookie\Middleware\EncryptCookies::class,
