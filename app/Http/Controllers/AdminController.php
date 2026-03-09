@@ -7,12 +7,20 @@ use App\Models\Product;
 use App\Models\Order;
 use App\Models\Category;
 use App\Models\ProductImage;
+use App\Services\CloudinaryService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Storage;
 
 class AdminController extends Controller
 {
+    protected $cloudinaryService;
+
+    public function __construct(CloudinaryService $cloudinaryService)
+    {
+        $this->cloudinaryService = $cloudinaryService;
+    }
+
     public function dashboard()
     {
         $stats = [
@@ -31,10 +39,15 @@ class AdminController extends Controller
             ->get();
 
         // Revenue by month (last 6 months)
+        // Use database-agnostic date formatting
+        $dateFormat = DB::getDriverName() === 'sqlite' 
+            ? "strftime('%Y-%m', created_at)" 
+            : "DATE_FORMAT(created_at, '%Y-%m')";
+        
         $revenue_by_month = Order::where('status', '!=', 'cancelled')
             ->where('created_at', '>=', now()->subMonths(6))
             ->select(
-                DB::raw('DATE_FORMAT(created_at, "%Y-%m") as month'),
+                DB::raw("{$dateFormat} as month"),
                 DB::raw('SUM(total) as revenue'),
                 DB::raw('COUNT(*) as orders')
             )
@@ -174,17 +187,56 @@ class AdminController extends Controller
 
             $product = Product::create($validated);
 
-            // Handle image uploads
+            // Handle image uploads with Cloudinary
             if ($request->hasFile('images')) {
+                $uploadedImages = [];
+                
                 foreach ($request->file('images') as $index => $image) {
-                    $path = $image->store('products', 'public');
-                    $imageUrl = Storage::url($path);
-                    
-                    ProductImage::create([
+                    try {
+                        // Validate image
+                        $validation = $this->cloudinaryService->validateImage($image);
+                        if (!$validation['valid']) {
+                            \Log::warning('Image validation failed', [
+                                'errors' => $validation['errors'],
+                                'filename' => $image->getClientOriginalName(),
+                            ]);
+                            continue;
+                        }
+
+                        // Upload to Cloudinary
+                        $result = $this->cloudinaryService->uploadImage(
+                            $image,
+                            'products/' . $product->id,
+                            [
+                                'public_id' => $product->slug . '_' . ($index + 1),
+                                'overwrite' => false,
+                            ]
+                        );
+
+                        if ($result['success']) {
+                            $uploadedImages[] = ProductImage::create([
+                                'product_id' => $product->id,
+                                'image_url' => $result['url'],
+                                'thumbnail_url' => $result['thumbnail_url'],
+                                'cloudinary_public_id' => $result['public_id'],
+                                'is_primary' => $index === 0,
+                                'sort_order' => $index,
+                                'width' => $result['width'],
+                                'height' => $result['height'],
+                            ]);
+                        }
+                    } catch (\Exception $e) {
+                        \Log::error('Failed to upload image to Cloudinary', [
+                            'error' => $e->getMessage(),
+                            'product_id' => $product->id,
+                            'filename' => $image->getClientOriginalName(),
+                        ]);
+                    }
+                }
+
+                if (empty($uploadedImages)) {
+                    \Log::warning('No images were successfully uploaded', [
                         'product_id' => $product->id,
-                        'image_url' => $imageUrl,
-                        'is_primary' => $index === 0, // First image is primary
-                        'sort_order' => $index,
                     ]);
                 }
             }
@@ -242,20 +294,51 @@ class AdminController extends Controller
 
             $product->update($validated);
 
-            // Handle new image uploads
+            // Handle new image uploads with Cloudinary
             if ($request->hasFile('images')) {
                 $currentImageCount = $product->images()->count();
                 
                 foreach ($request->file('images') as $index => $image) {
-                    $path = $image->store('products', 'public');
-                    $imageUrl = Storage::url($path);
-                    
-                    ProductImage::create([
-                        'product_id' => $product->id,
-                        'image_url' => $imageUrl,
-                        'is_primary' => $currentImageCount === 0 && $index === 0,
-                        'sort_order' => $currentImageCount + $index,
-                    ]);
+                    try {
+                        // Validate image
+                        $validation = $this->cloudinaryService->validateImage($image);
+                        if (!$validation['valid']) {
+                            \Log::warning('Image validation failed', [
+                                'errors' => $validation['errors'],
+                                'filename' => $image->getClientOriginalName(),
+                            ]);
+                            continue;
+                        }
+
+                        // Upload to Cloudinary
+                        $result = $this->cloudinaryService->uploadImage(
+                            $image,
+                            'products/' . $product->id,
+                            [
+                                'public_id' => $product->slug . '_' . ($currentImageCount + $index + 1),
+                                'overwrite' => false,
+                            ]
+                        );
+
+                        if ($result['success']) {
+                            ProductImage::create([
+                                'product_id' => $product->id,
+                                'image_url' => $result['url'],
+                                'thumbnail_url' => $result['thumbnail_url'],
+                                'cloudinary_public_id' => $result['public_id'],
+                                'is_primary' => $currentImageCount === 0 && $index === 0,
+                                'sort_order' => $currentImageCount + $index,
+                                'width' => $result['width'],
+                                'height' => $result['height'],
+                            ]);
+                        }
+                    } catch (\Exception $e) {
+                        \Log::error('Failed to upload image to Cloudinary', [
+                            'error' => $e->getMessage(),
+                            'product_id' => $product->id,
+                            'filename' => $image->getClientOriginalName(),
+                        ]);
+                    }
                 }
             }
 
@@ -297,9 +380,21 @@ class AdminController extends Controller
 
     public function deleteProductImage(ProductImage $image)
     {
-        // Delete file from storage
-        $path = str_replace('/storage/', '', $image->image_url);
-        Storage::disk('public')->delete($path);
+        // Delete from Cloudinary if public_id exists
+        if ($image->cloudinary_public_id) {
+            try {
+                $this->cloudinaryService->deleteImage($image->cloudinary_public_id);
+            } catch (\Exception $e) {
+                \Log::error('Failed to delete image from Cloudinary', [
+                    'error' => $e->getMessage(),
+                    'public_id' => $image->cloudinary_public_id,
+                ]);
+            }
+        } else {
+            // Fallback: Delete from local storage
+            $path = str_replace('/storage/', '', $image->image_url);
+            Storage::disk('public')->delete($path);
+        }
 
         // Delete database record
         $image->delete();

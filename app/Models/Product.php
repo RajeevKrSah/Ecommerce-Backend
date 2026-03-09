@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\SoftDeletes;
 
 class Product extends Model
@@ -42,6 +43,18 @@ class Product extends Model
     public function images(): HasMany
     {
         return $this->hasMany(ProductImage::class)->orderBy('sort_order');
+    }
+
+    public function colors(): BelongsToMany
+    {
+        return $this->belongsToMany(Color::class, 'product_colors')
+            ->withTimestamps();
+    }
+
+    public function sizes(): BelongsToMany
+    {
+        return $this->belongsToMany(Size::class, 'product_sizes')
+            ->withTimestamps();
     }
 
     public function getCurrentPriceAttribute(): float

@@ -11,32 +11,18 @@ return Application::configure(basePath: dirname(__DIR__))
         commands: __DIR__.'/../routes/console.php',
         health: '/up',
     )
-    ->withMiddleware(function (Middleware $middleware): void {
-        // Global middleware
-        $middleware->append(\App\Http\Middleware\SecurityHeaders::class);
-        
-        // Middleware aliases
+    ->withMiddleware(function (Middleware $middleware) {
         $middleware->alias([
-            'admin' => \App\Http\Middleware\AdminMiddleware::class,
-        ]);
-        
-        // Web middleware group
-        $middleware->web([
-            \Illuminate\Cookie\Middleware\EncryptCookies::class,
-            \Illuminate\Cookie\Middleware\AddQueuedCookiesToResponse::class,
-            \Illuminate\Session\Middleware\StartSession::class,
-            \Illuminate\View\Middleware\ShareErrorsFromSession::class,
-            \App\Http\Middleware\VerifyCsrfToken::class,
-            \Illuminate\Routing\Middleware\SubstituteBindings::class,
+            'role' => \App\Http\Middleware\RoleMiddleware::class,
         ]);
 
-        // API middleware group - NO CSRF validation
-        $middleware->api([
+        $middleware->api(prepend: [
             \Laravel\Sanctum\Http\Middleware\EnsureFrontendRequestsAreStateful::class,
-            \Illuminate\Routing\Middleware\SubstituteBindings::class,
         ]);
+
+        // Use database-based throttling instead of Redis
+        $middleware->throttleApi('60,1');
     })
-    ->withExceptions(function (Exceptions $exceptions): void {
+    ->withExceptions(function (Exceptions $exceptions) {
         //
-    })
-    ->create();
+    })->create();

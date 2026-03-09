@@ -8,6 +8,7 @@ use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Validator;
+use Illuminate\Support\Facades\Log;
 
 class AuthController extends Controller
 {
@@ -21,7 +22,7 @@ class AuthController extends Controller
                 'required',
                 'string',
                 'max:255',
-                'regex:/^[a-zA-Z\s]+$/', // Only letters and spaces
+                'regex:/^[a-zA-Z\s]+$/',
                 'min:2'
             ],
             'email' => [
@@ -59,26 +60,44 @@ class AuthController extends Controller
                 'name' => trim($request->name),
                 'email' => strtolower(trim($request->email)),
                 'password' => Hash::make($request->password),
-                'email_verified_at' => null, // Will be set after email verification
+                'email_verified_at' => null,
             ]);
 
-            // Create token with expiration
+            // Assign default 'user' role
+            $user->assignRole('user');
+
+            // Create token
             $token = $user->createToken('auth_token', ['*'], now()->addMinutes(config('sanctum.expiration')))->plainTextToken;
+
+            Log::info('User registered successfully', [
+                'user_id' => $user->id,
+                'email' => $user->email,
+                'role' => 'user',
+            ]);
 
             return response()->json([
                 'message' => 'Registration successful',
-                'user' => [
-                    'id' => $user->id,
-                    'name' => $user->name,
-                    'email' => $user->email,
-                    'email_verified_at' => $user->email_verified_at,
+                'data' => [
+                    'user' => [
+                        'id' => $user->id,
+                        'name' => $user->name,
+                        'email' => $user->email,
+                        'email_verified_at' => $user->email_verified_at,
+                    ],
+                    'role' => 'user',
+                    'token' => $token,
                 ],
                 'access_token' => $token,
                 'token_type' => 'Bearer',
-                'expires_in' => config('sanctum.expiration') * 60, // in seconds
+                'expires_in' => config('sanctum.expiration') * 60,
             ], 201);
 
         } catch (\Exception $e) {
+            Log::error('Registration failed', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
             return response()->json([
                 'message' => 'Registration failed. Please try again.'
             ], 500);
@@ -86,21 +105,13 @@ class AuthController extends Controller
     }
 
     /**
-     * Login user
+     * User login (for regular users)
      */
     public function login(Request $request)
     {
         $validator = Validator::make($request->all(), [
-            'email' => [
-                'required',
-                'email:rfc',
-                'max:255'
-            ],
-            'password' => [
-                'required',
-                'string',
-                'min:6'
-            ],
+            'email' => ['required', 'email:rfc', 'max:255'],
+            'password' => ['required', 'string', 'min:6'],
         ]);
 
         if ($validator->fails()) {
@@ -110,36 +121,181 @@ class AuthController extends Controller
             ], 422);
         }
 
+        $email = strtolower(trim($request->email));
+        $user = User::where('email', $email)->first();
+
+        // Check if account is locked
+        if ($user && $user->isLocked()) {
+            return response()->json([
+                'message' => 'Account is temporarily locked due to multiple failed login attempts. Please try again later.',
+                'locked_until' => $user->locked_until,
+            ], 423);
+        }
+
         $credentials = [
-            'email' => strtolower(trim($request->email)),
+            'email' => $email,
             'password' => $request->password
         ];
 
         if (!Auth::attempt($credentials)) {
+            // Increment failed attempts
+            if ($user) {
+                $user->incrementFailedAttempts();
+            }
+
+            Log::warning('Failed login attempt', [
+                'email' => $email,
+                'ip' => $request->ip(),
+            ]);
+
             return response()->json([
                 'message' => 'Invalid credentials'
             ], 401);
         }
 
         $user = Auth::user();
-        
-        // Revoke all existing tokens for security
+
+        // Reset failed attempts on successful login
+        $user->resetFailedAttempts();
+
+        // Revoke all existing tokens
         $user->tokens()->delete();
 
-        // Create new token with expiration
+        // Create new token
         $token = $user->createToken('auth_token', ['*'], now()->addMinutes(config('sanctum.expiration')))->plainTextToken;
+
+        $role = $user->getPrimaryRole();
+
+        Log::info('User logged in successfully', [
+            'user_id' => $user->id,
+            'email' => $user->email,
+            'role' => $role,
+            'ip' => $request->ip(),
+        ]);
 
         return response()->json([
             'message' => 'Login successful',
-            'user' => [
-                'id' => $user->id,
-                'name' => $user->name,
-                'email' => $user->email,
-                'email_verified_at' => $user->email_verified_at,
+            'data' => [
+                'user' => [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'email_verified_at' => $user->email_verified_at,
+                ],
+                'role' => $role,
+                'token' => $token,
             ],
             'access_token' => $token,
             'token_type' => 'Bearer',
-            'expires_in' => config('sanctum.expiration') * 60, // in seconds
+            'expires_in' => config('sanctum.expiration') * 60,
+        ]);
+    }
+
+    /**
+     * Admin login (for admin and super_admin only)
+     */
+    public function adminLogin(Request $request)
+    {
+        $validator = Validator::make($request->all(), [
+            'email' => ['required', 'email:rfc', 'max:255'],
+            'password' => ['required', 'string', 'min:6'],
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'message' => 'Invalid credentials format',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $email = strtolower(trim($request->email));
+        $user = User::where('email', $email)->first();
+
+        // Check if account is locked
+        if ($user && $user->isLocked()) {
+            Log::warning('Admin login attempt on locked account', [
+                'email' => $email,
+                'ip' => $request->ip(),
+            ]);
+
+            return response()->json([
+                'message' => 'Account is temporarily locked due to multiple failed login attempts. Please try again later.',
+                'locked_until' => $user->locked_until,
+            ], 423);
+        }
+
+        $credentials = [
+            'email' => $email,
+            'password' => $request->password
+        ];
+
+        if (!Auth::attempt($credentials)) {
+            // Increment failed attempts
+            if ($user) {
+                $user->incrementFailedAttempts();
+            }
+
+            Log::warning('Failed admin login attempt', [
+                'email' => $email,
+                'ip' => $request->ip(),
+            ]);
+
+            return response()->json([
+                'message' => 'Invalid credentials'
+            ], 401);
+        }
+
+        $user = Auth::user();
+
+        // Check if user has admin or super_admin role
+        if (!$user->hasAnyRole(['admin', 'super_admin'])) {
+            Log::warning('Non-admin user attempted admin login', [
+                'user_id' => $user->id,
+                'email' => $user->email,
+                'role' => $user->getPrimaryRole(),
+                'ip' => $request->ip(),
+            ]);
+
+            Auth::logout();
+
+            return response()->json([
+                'message' => 'Unauthorized. Admin access required.'
+            ], 403);
+        }
+
+        // Reset failed attempts on successful login
+        $user->resetFailedAttempts();
+
+        // Revoke all existing tokens
+        $user->tokens()->delete();
+
+        // Create new token
+        $token = $user->createToken('admin_auth_token', ['*'], now()->addMinutes(config('sanctum.expiration')))->plainTextToken;
+
+        $role = $user->getPrimaryRole();
+
+        Log::info('Admin logged in successfully', [
+            'user_id' => $user->id,
+            'email' => $user->email,
+            'role' => $role,
+            'ip' => $request->ip(),
+        ]);
+
+        return response()->json([
+            'message' => 'Admin login successful',
+            'data' => [
+                'user' => [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'email_verified_at' => $user->email_verified_at,
+                ],
+                'role' => $role,
+                'token' => $token,
+            ],
+            'access_token' => $token,
+            'token_type' => 'Bearer',
+            'expires_in' => config('sanctum.expiration') * 60,
         ]);
     }
 
@@ -149,9 +305,12 @@ class AuthController extends Controller
     public function logout(Request $request)
     {
         try {
-            // Delete current token
             $request->user()->currentAccessToken()->delete();
             
+            Log::info('User logged out', [
+                'user_id' => $request->user()->id,
+            ]);
+
             return response()->json([
                 'message' => 'Logged out successfully'
             ]);
@@ -168,9 +327,12 @@ class AuthController extends Controller
     public function logoutAll(Request $request)
     {
         try {
-            // Delete all tokens for the user
             $request->user()->tokens()->delete();
             
+            Log::info('User logged out from all devices', [
+                'user_id' => $request->user()->id,
+            ]);
+
             return response()->json([
                 'message' => 'Logged out from all devices successfully'
             ]);
@@ -186,15 +348,19 @@ class AuthController extends Controller
      */
     public function profile(Request $request)
     {
+        $user = $request->user();
+        $role = $user->getPrimaryRole();
+
         return response()->json([
             'user' => [
-                'id' => $request->user()->id,
-                'name' => $request->user()->name,
-                'email' => $request->user()->email,
-                'role' => $request->user()->role,
-                'email_verified_at' => $request->user()->email_verified_at,
-                'created_at' => $request->user()->created_at,
-                'updated_at' => $request->user()->updated_at,
+                'id' => $user->id,
+                'name' => $user->name,
+                'email' => $user->email,
+                'role' => $role,
+                'permissions' => $user->getAllPermissions()->pluck('name'),
+                'email_verified_at' => $user->email_verified_at,
+                'created_at' => $user->created_at,
+                'updated_at' => $user->updated_at,
             ]
         ]);
     }
